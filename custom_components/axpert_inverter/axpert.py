@@ -1,149 +1,70 @@
+import os
 import time
 import threading
 import logging
 import usb.core
 import usb.util
 
-from .const import BACKEND_HIDRAW, BACKEND_USB
-from .hidraw import HidrawConnection, resolve_hidraw_path
-
 _LOGGER = logging.getLogger(__name__)
 
 class USBConnection:
     """Helper to handle USB connection."""
-    def __init__(self, vid=0x0665, pid=0x5161, timeout=5000):
-        self.vid = vid
-        self.pid = pid
+    def __init__(self, device_path="/dev/hidraw0", timeout=5000):
+        self.device_path = device_path or "/dev/hidraw0"
         self.timeout = timeout
-        self.dev = None
-        self.ep_in = None
-        self.ep_out = None
+        self.fd = None
 
     def __enter__(self):
-        self.dev = usb.core.find(idVendor=self.vid, idProduct=self.pid)
-        if self.dev is None:
-            raise ValueError(f"Device {hex(self.vid)}:{hex(self.pid)} not found")
-
-        # Helper to detach kernel driver for interface 0 (the main HID interface)
-        if self.dev.is_kernel_driver_active(0):
-            try:
-                self.dev.detach_kernel_driver(0)
-                _LOGGER.debug("Detached kernel driver from interface 0")
-            except usb.core.USBError as e:
-                _LOGGER.warning(f"Could not detach kernel driver: {e}")
-
-        # Set configuration
-        try:
-            self.dev.set_configuration()
-        except usb.core.USBError as e:
-            if e.errno == 16: # Resource busy
-                 # If we are already configured, this might happen and be okay
-                 _LOGGER.debug("Device busy during set_configuration, assuming already configured.")
-            else:
-                 _LOGGER.warning(f"Could not set configuration: {e}")
-
-        # Explicitly claim interface 0
-        try:
-            usb.util.claim_interface(self.dev, 0)
-        except usb.core.USBError as e:
-            _LOGGER.error(f"Could not claim interface 0: {e}")
-            raise e
-
-        # Iterate over all configurations/interfaces/endpoints to find the first valid pair
-        cfg = self.dev.get_active_configuration()
-        
-        for intf in cfg:
-            for ep in intf:
-                if usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_OUT:
-                    if self.ep_out is None: 
-                        self.ep_out = ep
-                elif usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_IN:
-                    if self.ep_in is None: 
-                        self.ep_in = ep
-            
-            if self.ep_out and self.ep_in:
-                break
-        
-        if not self.ep_in:
-            _LOGGER.error(f"Could not find IN endpoint. Configuration: {cfg}")
-            raise ValueError("Could not find IN endpoint")
-            
-        if not self.ep_out:
-            _LOGGER.debug("No OUT endpoint found. Will use Control Transfer (SET_REPORT) for writing.")
-        
+        if not os.path.exists(self.device_path):
+            raise FileNotFoundError(f"HID device {self.device_path} not found")
+        self.fd = os.open(self.device_path, os.O_RDWR | os.O_NONBLOCK)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            usb.util.release_interface(self.dev, 0)
-        except Exception:
-            pass
-        # Attach kernel driver back
-        if self.dev is not None:
-            usb.util.dispose_resources(self.dev)
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except Exception:
+                pass
+            self.fd = None
 
     def write(self, data: bytes):
-        if self.ep_out:
-            # Use Interrrupt OUT
-            chunk_size = 8
-            offset = 0
-            while offset < len(data):
-                chunk = data[offset:offset+chunk_size]
-                self.ep_out.write(chunk, self.timeout)
-                offset += chunk_size
-                time.sleep(0.01)
-        else:
-            # Use Control Transfer (HID SET_REPORT)
-            # bmRequestType: 0x21 (Host to Device | Class | Interface)
-            # bRequest: 0x09 (SET_REPORT)
-            # wValue: (0x02 << 8) | 0x00 (Output Report, ID 0)
-            # wIndex: 0 (Interface 0)
-            chunk_size = 8
-            offset = 0
-            while offset < len(data):
-                chunk = data[offset:offset+chunk_size]
-                # Pad to 8 bytes if needed? Some reports require fixed size.
-                # But let's try raw chunk first.
-                
-                # Note: Some devices expect the Report ID to be prepended if it's not 0.
-                # Assuming Report ID 0.
-                
-                try:
-                    self.dev.ctrl_transfer(0x21, 0x09, 0x200, 0, chunk, self.timeout)
-                except usb.core.USBError as e:
-                    _LOGGER.error(f"Control transfer failed: {e}")
-                    raise e
-                    
-                offset += chunk_size
-                time.sleep(0.01)
+        chunk_size = 8
+        for i in range(0, len(data), chunk_size):
+            chunk = data[i:i + chunk_size].ljust(chunk_size, b'\x00')
+            os.write(self.fd, chunk)
+            time.sleep(0.03)
 
     def read_until(self, terminator=b'\r') -> bytes:
-        if not self.ep_in:
-            return b""
-            
-        res = b""
-        start = time.time()
-        timeout_sec = self.timeout / 1000.0
+        res = bytearray()
+        deadline = time.time() + (self.timeout / 1000.0)
         
-        while (time.time() - start) < timeout_sec:
+        while time.time() < deadline:
             try:
-                # Read 8 bytes (max packet size) with short timeout (100ms)
-                # This prevents blocking for full timeout if buffer isn't full
-                data = self.ep_in.read(8, 200)
-                res += bytes(data)
-                if terminator in res:
-                    break
-            except usb.core.USBError as e:
-                if e.errno == 110: # Timeout
-                    continue
-                # If "No data available" or other non-fatal error, continue
-                # _LOGGER.debug(f"USB Read Error: {e}")
-                continue
-                
-        return res
+                data = os.read(self.fd, 64)
+                if data:
+                    clean_chunk = data.replace(b'\x00', b'')
+                    if clean_chunk:
+                        res.extend(clean_chunk)
+                        if terminator in res:
+                            term_idx = res.index(terminator)
+                            return bytes(res[:term_idx + 1])
+            except BlockingIOError:
+                time.sleep(0.02)
+            except OSError:
+                time.sleep(0.02)
+
+        return bytes(res)
 
     def reset_input_buffer(self):
-        pass
+        if self.fd is None:
+            return
+        while True:
+            try:
+                if not os.read(self.fd, 64):
+                    break
+            except BlockingIOError:
+                break
 
     def reset_output_buffer(self):
         pass
@@ -151,25 +72,11 @@ class USBConnection:
 class AxpertInverter:
     """Class to communicate with the Axpert Inverter via HID."""
 
-    def __init__(self, device_path: str | None, backend: str = BACKEND_USB, device_phys: str | None = None):
-        """Initialize the inverter interface.
-
-        backend "hidraw" talks to /dev/hidrawN (device_phys, if given, keeps the
-        device findable when the node number changes). backend "usb" is the legacy
-        pyusb transport, which ignores the path and looks for VID:PID 0665:5161.
-        """
+    def __init__(self, device_path: str):
+        """Initialize the inverter interface."""
         self._device_path = device_path
-        self._backend = backend
-        self._device_phys = device_phys
         self._lock = threading.Lock()
         self._last_command_time = 0
-
-    def _open_connection(self):
-        """Open a transport for one command exchange."""
-        if self._backend == BACKEND_HIDRAW:
-            path = resolve_hidraw_path(self._device_path, self._device_phys)
-            return HidrawConnection(path, timeout=5000)
-        return USBConnection(timeout=5000)
 
     def _get_crc(self, cmd: str | bytes) -> bytes:
         """Calculate CRC16-XMODEM."""
@@ -212,7 +119,8 @@ class AxpertInverter:
                 try:
                     # Open USB device
                     
-                    with self._open_connection() as ser:
+                    # NOTE: We ignore device_path and look for VID:PID 0665:5161
+                    with USBConnection(device_path=self._device_path, timeout=5000) as ser:
                         # Prepare command
                         crc = self._get_crc(command)
                         full_command = command.encode() + crc + b'\r'
